@@ -1,17 +1,17 @@
 package main
 
 import (
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"time"
-
-	"fmt"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/storage/remote"
+	"github.com/prometheus/log"
+	"github.com/prometheus/prometheus/prompb"
 	"gopkg.in/tylerb/graceful.v1"
 )
 
@@ -40,13 +40,13 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 
 	c.writer, err = NewP2CWriter(conf, c.requests)
 	if err != nil {
-		fmt.Printf("Error creating clickhouse writer: %s\n", err.Error())
+		log.Errorf("Error creating clickhouse writer: %s\n", err.Error())
 		return c, err
 	}
 
 	c.reader, err = NewP2CReader(conf)
 	if err != nil {
-		fmt.Printf("Error creating clickhouse reader: %s\n", err.Error())
+		log.Errorf("Error creating clickhouse reader: %s\n", err.Error())
 		return c, err
 	}
 
@@ -71,7 +71,7 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 			return
 		}
 
-		var req remote.WriteRequest
+		var req prompb.WriteRequest
 		if err := proto.Unmarshal(reqBuf, &req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -93,13 +93,13 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 			return
 		}
 
-		var req remote.ReadRequest
+		var req prompb.ReadRequest
 		if err := proto.Unmarshal(reqBuf, &req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		var resp *remote.ReadResponse
+		var resp *prompb.ReadResponse
 		resp, err = c.reader.Read(&req)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -117,7 +117,7 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 
 		compressed = snappy.Encode(nil, data)
 		if _, err := w.Write(compressed); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Error(err)
 			return
 		}
 	})
@@ -129,7 +129,7 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 	return c, nil
 }
 
-func (c *p2cServer) process(req remote.WriteRequest) {
+func (c *p2cServer) process(req prompb.WriteRequest) {
 	for _, series := range req.Timeseries {
 		c.rx.Add(float64(len(series.Samples)))
 		var (
@@ -151,7 +151,7 @@ func (c *p2cServer) process(req remote.WriteRequest) {
 		for _, sample := range series.Samples {
 			p2c := new(p2cRequest)
 			p2c.name = name
-			p2c.ts = time.Unix(sample.TimestampMs/1000, 0)
+			p2c.ts = time.Unix(sample.Timestamp, 0)
 			p2c.val = sample.Value
 			p2c.tags = tags
 			c.requests <- p2c
@@ -161,7 +161,7 @@ func (c *p2cServer) process(req remote.WriteRequest) {
 }
 
 func (c *p2cServer) Start() error {
-	fmt.Println("HTTP server starting...")
+	log.Infoln("HTTP server starting...")
 	c.writer.Start()
 	return graceful.RunWithErr(c.conf.HTTPAddr, c.conf.HTTPTimeout, c.mux)
 }
@@ -178,10 +178,10 @@ func (c *p2cServer) Shutdown() {
 
 	select {
 	case <-wchan:
-		fmt.Println("Writer shutdown cleanly..")
+		log.Infof("Writer shutdown cleanly..")
 	// All done!
 	case <-time.After(10 * time.Second):
-		fmt.Println("Writer shutdown timed out, samples will be lost..")
+		log.Warnf("Writer shutdown timed out, samples will be lost..")
 	}
 
 }

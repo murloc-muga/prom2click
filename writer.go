@@ -10,6 +10,7 @@ import (
 
 	"github.com/kshvakov/clickhouse"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/log"
 )
 
 var insertSQL = `INSERT INTO %s.%s
@@ -34,7 +35,7 @@ func NewP2CWriter(conf *config, reqs chan *p2cRequest) (*p2cWriter, error) {
 	w.requests = reqs
 	w.db, err = sql.Open("clickhouse", w.conf.ChDSN)
 	if err != nil {
-		fmt.Printf("Error connecting to clickhouse: %s\n", err.Error())
+		log.Errorf("connecting to clickhouse: %s\n", err.Error())
 		return w, err
 	}
 
@@ -78,7 +79,7 @@ func (w *p2cWriter) Start() {
 
 	go func() {
 		w.wg.Add(1)
-		fmt.Println("Writer starting..")
+		log.Infoln("Writer starting..")
 		sql := fmt.Sprintf(insertSQL, w.conf.ChDB, w.conf.ChTable)
 		ok := true
 		for ok {
@@ -92,7 +93,7 @@ func (w *p2cWriter) Start() {
 				// get requet and also check if channel is closed
 				req, ok = <-w.requests
 				if !ok {
-					fmt.Println("Writer stopping..")
+					log.Warnln("Writer stopping..")
 					break
 				}
 				reqs = append(reqs, req)
@@ -107,7 +108,7 @@ func (w *p2cWriter) Start() {
 			// post them to db all at once
 			tx, err := w.db.Begin()
 			if err != nil {
-				fmt.Printf("Error: begin transaction: %s\n", err.Error())
+				log.Errorf("begin transaction: %s\n", err.Error())
 				w.ko.Add(1.0)
 				continue
 			}
@@ -116,7 +117,7 @@ func (w *p2cWriter) Start() {
 			smt, err := tx.Prepare(sql)
 			for _, req := range reqs {
 				if err != nil {
-					fmt.Printf("Error: prepare statement: %s\n", err.Error())
+					log.Errorf("prepare statement: %s\n", err.Error())
 					w.ko.Add(1.0)
 					continue
 				}
@@ -128,14 +129,14 @@ func (w *p2cWriter) Start() {
 					req.val, req.ts)
 
 				if err != nil {
-					fmt.Printf("Error: statement exec: %s\n", err.Error())
+					log.Errorf("statement exec: %s\n", err.Error())
 					w.ko.Add(1.0)
 				}
 			}
 
 			// commit and record metrics
 			if err = tx.Commit(); err != nil {
-				fmt.Printf("Error: commit failed: %s\n", err.Error())
+				log.Errorf("commit failed: %s\n", err.Error())
 				w.ko.Add(1.0)
 			} else {
 				w.tx.Add(float64(nmetrics))
@@ -143,7 +144,7 @@ func (w *p2cWriter) Start() {
 			}
 
 		}
-		fmt.Println("Writer stopped..")
+		log.Infoln("Writer stopped..")
 		w.wg.Done()
 	}()
 }

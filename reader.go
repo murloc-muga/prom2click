@@ -7,8 +7,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/storage/remote"
+	"github.com/prometheus/prometheus/prompb"
 )
 
 type p2cReader struct {
@@ -17,7 +18,7 @@ type p2cReader struct {
 }
 
 // getTimePeriod return select and where SQL chunks relating to the time period -or- error
-func (r *p2cReader) getTimePeriod(query *remote.Query) (string, string, error) {
+func (r *p2cReader) getTimePeriod(query *prompb.Query) (string, string, error) {
 
 	var tselSQL = "SELECT COUNT() AS CNT, (intDiv(toUInt32(ts), %d) * %d) * 1000 as t"
 	var twhereSQL = "WHERE date >= toDate(%d) AND ts >= toDateTime(%d) AND ts <= toDateTime(%d)"
@@ -50,7 +51,7 @@ func (r *p2cReader) getTimePeriod(query *remote.Query) (string, string, error) {
 	return selectSQL, whereSQL, nil
 }
 
-func (r *p2cReader) getSQL(query *remote.Query) (string, error) {
+func (r *p2cReader) getSQL(query *prompb.Query) (string, error) {
 	// time related select sql, where sql chunks
 	tselectSQL, twhereSQL, err := r.getTimePeriod(query)
 	if err != nil {
@@ -68,13 +69,13 @@ func (r *p2cReader) getSQL(query *remote.Query) (string, error) {
 		if m.Name == model.MetricNameLabel {
 			var whereAdd string
 			switch m.Type {
-			case remote.MatchType_EQUAL:
+			case prompb.LabelMatcher_EQ:
 				whereAdd = fmt.Sprintf(` name='%s' `, strings.Replace(m.Value, `'`, `\'`, -1))
-			case remote.MatchType_NOT_EQUAL:
+			case prompb.LabelMatcher_NEQ:
 				whereAdd = fmt.Sprintf(` name!='%s' `, strings.Replace(m.Value, `'`, `\'`, -1))
-			case remote.MatchType_REGEX_MATCH:
+			case prompb.LabelMatcher_RE:
 				whereAdd = fmt.Sprintf(` match(name, %s) = 1 `, strings.Replace(m.Value, `/`, `\/`, -1))
-			case remote.MatchType_REGEX_NO_MATCH:
+			case prompb.LabelMatcher_NRE:
 				whereAdd = fmt.Sprintf(` match(name, %s) = 0 `, strings.Replace(m.Value, `/`, `\/`, -1))
 			}
 			mwhereSQL = append(mwhereSQL, whereAdd)
@@ -82,7 +83,7 @@ func (r *p2cReader) getSQL(query *remote.Query) (string, error) {
 		}
 
 		switch m.Type {
-		case remote.MatchType_EQUAL:
+		case prompb.LabelMatcher_EQ:
 			var insql bytes.Buffer
 			asql := "arrayExists(x -> x IN (%s), tags) = 1"
 			// value appears to be | sep'd for multiple matches
@@ -101,7 +102,7 @@ func (r *p2cReader) getSQL(query *remote.Query) (string, error) {
 			wstr := fmt.Sprintf(asql, insql.String())
 			mwhereSQL = append(mwhereSQL, wstr)
 
-		case remote.MatchType_NOT_EQUAL:
+		case prompb.LabelMatcher_NEQ:
 			var insql bytes.Buffer
 			asql := "arrayExists(x -> x IN (%s), tags) = 0"
 			// value appears to be | sep'd for multiple matches
@@ -120,7 +121,7 @@ func (r *p2cReader) getSQL(query *remote.Query) (string, error) {
 			wstr := fmt.Sprintf(asql, insql.String())
 			mwhereSQL = append(mwhereSQL, wstr)
 
-		case remote.MatchType_REGEX_MATCH:
+		case prompb.LabelMatcher_RE:
 			asql := `arrayExists(x -> 1 == match(x, '^%s=%s'),tags) = 1`
 			// we can't have ^ in the regexp since keys are stored in arrays of key=value
 			if strings.HasPrefix(m.Value, "^") {
@@ -132,7 +133,7 @@ func (r *p2cReader) getSQL(query *remote.Query) (string, error) {
 				mwhereSQL = append(mwhereSQL, fmt.Sprintf(asql, m.Name, val))
 			}
 
-		case remote.MatchType_REGEX_NO_MATCH:
+		case prompb.LabelMatcher_NRE:
 			asql := `arrayExists(x -> 1 == match(x, '^%s=%s'),tags) = 0`
 			if strings.HasPrefix(m.Value, "^") {
 				val := strings.Replace(m.Value, "^", "", 1)
@@ -158,51 +159,51 @@ func NewP2CReader(conf *config) (*p2cReader, error) {
 	r.conf = conf
 	r.db, err = sql.Open("clickhouse", r.conf.ChDSN)
 	if err != nil {
-		fmt.Printf("Error connecting to clickhouse: %s\n", err.Error())
+		log.Errorf("Error connecting to clickhouse: %s\n", err.Error())
 		return r, err
 	}
 
 	return r, nil
 }
 
-func (r *p2cReader) Read(req *remote.ReadRequest) (*remote.ReadResponse, error) {
+func (r *p2cReader) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
 	var err error
 	var sqlStr string
 	var rows *sql.Rows
 
-	resp := remote.ReadResponse{
-		Results: []*remote.QueryResult{
-			{Timeseries: make([]*remote.TimeSeries, 0, 0)},
+	resp := prompb.ReadResponse{
+		Results: []*prompb.QueryResult{
+			{Timeseries: make([]*prompb.TimeSeries, 0, 0)},
 		},
 	}
 	// need to map tags to timeseries to record samples
-	var tsres = make(map[string]*remote.TimeSeries)
+	var tsres = make(map[string]*prompb.TimeSeries)
 
 	// for debugging/figuring out query format/etc
 	rcount := 0
 	for _, q := range req.Queries {
 		// remove me..
-		fmt.Printf("\nquery: start: %d, end: %d\n\n", q.StartTimestampMs, q.EndTimestampMs)
+		log.Debugf("\nquery: start: %d, end: %d\n\n", q.StartTimestampMs, q.EndTimestampMs)
 
 		// get the select sql
 		sqlStr, err = r.getSQL(q)
-		fmt.Printf("query: running sql: %s\n\n", sqlStr)
+		log.Debugf("query: running sql: %s\n\n", sqlStr)
 		if err != nil {
-			fmt.Printf("Error: reader: getSQL: %s\n", err.Error())
+			log.Errorf("reader: getSQL: %s\n", err.Error())
 			return &resp, err
 		}
 
 		// get the select sql
 		if err != nil {
-			fmt.Printf("Error: reader: getSQL: %s\n", err.Error())
+			log.Errorf("reader: getSQL: %s\n", err.Error())
 			return &resp, err
 		}
 
 		// todo: metrics on number of errors, rows, selects, timings, etc
 		rows, err = r.db.Query(sqlStr)
 		if err != nil {
-			fmt.Printf("Error: query failed: %s", sqlStr)
-			fmt.Printf("Error: query error: %s\n", err)
+			log.Errorf("query failed: %s", sqlStr)
+			log.Errorf("query error: %s\n", err)
 			return &resp, err
 		}
 
@@ -218,23 +219,22 @@ func (r *p2cReader) Read(req *remote.ReadRequest) (*remote.ReadResponse, error) 
 				value float64
 			)
 			if err = rows.Scan(&cnt, &t, &name, &tags, &value); err != nil {
-				fmt.Printf("Error: scan: %s\n", err.Error())
+				log.Errorf("scan: %s\n", err.Error())
 			}
-			// remove this..
-			//fmt.Printf(fmt.Sprintf("%d,%d,%s,%s,%f\n", cnt, t, name, strings.Join(tags, ":"), value))
 
 			// borrowed from influx remote storage adapter - array sep
 			key := strings.Join(tags, "\xff")
 			ts, ok := tsres[key]
 			if !ok {
-				ts = &remote.TimeSeries{
+				ts = &prompb.TimeSeries{
 					Labels: makeLabels(tags),
 				}
 				tsres[key] = ts
 			}
-			ts.Samples = append(ts.Samples, &remote.Sample{
-				Value:       float64(value),
-				TimestampMs: t,
+			ts.Samples = append(ts.Samples, prompb.Sample{
+				Value: float64(value),
+				// TimestampMs: t,
+				Timestamp: t,
 			})
 		}
 	}
@@ -244,26 +244,26 @@ func (r *p2cReader) Read(req *remote.ReadRequest) (*remote.ReadResponse, error) 
 		resp.Results[0].Timeseries = append(resp.Results[0].Timeseries, ts)
 	}
 
-	fmt.Printf("query: returning %d rows for %d queries\n", rcount, len(req.Queries))
+	log.Debugf("query: returning %d rows for %d queries\n", rcount, len(req.Queries))
 
 	return &resp, nil
 
 }
 
-func makeLabels(tags []string) []*remote.LabelPair {
-	lpairs := make([]*remote.LabelPair, 0, len(tags))
+func makeLabels(tags []string) []prompb.Label {
+	lpairs := make([]prompb.Label, 0, len(tags))
 	// (currently) writer includes __name__ in tags so no need to add it here
 	// may change this to save space later..
 	for _, tag := range tags {
 		vals := strings.SplitN(tag, "=", 2)
 		if len(vals) != 2 {
-			fmt.Printf("Error unpacking tag key/val: %s\n", tag)
+			log.Errorf("unpacking tag key/val: %s\n", tag)
 			continue
 		}
 		if vals[1] == "" {
 			continue
 		}
-		lpairs = append(lpairs, &remote.LabelPair{
+		lpairs = append(lpairs, prompb.Label{
 			Name:  vals[0],
 			Value: vals[1],
 		})

@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/prometheus/common/log"
+	"github.com/prometheus/common/version"
 )
 
 // a lot of this borrows directly from:
@@ -24,6 +27,7 @@ type config struct {
 	HTTPAddr        string
 	HTTPWritePath   string
 	HTTPMetricsPath string
+	LogLevel        string
 }
 
 var (
@@ -31,37 +35,28 @@ var (
 )
 
 func main() {
-	excode := 0
-
 	conf := parseFlags()
 
 	if versionFlag {
-		fmt.Println("Git Commit:", GitCommit)
-		fmt.Println("Version:", Version)
-		if VersionPrerelease != "" {
-			fmt.Println("Version PreRelease:", VersionPrerelease)
-		}
-		os.Exit(excode)
+		fmt.Println(version.Print("prom2click"))
+		return
 	}
-
-	fmt.Println("Starting up..")
+	log.Base().SetLevel(conf.LogLevel)
+	log.Infoln("Starting up..")
 
 	srv, err := NewP2CServer(conf)
 	if err != nil {
-		fmt.Printf("Error: could not create server: %s\n", err.Error())
-		excode = 1
-		os.Exit(excode)
+		log.Errorf("Error: could not create server: %s\n", err.Error())
+		return
 	}
 	err = srv.Start()
 	if err != nil {
-		fmt.Printf("Error: http server returned error: %s\n", err.Error())
-		excode = 1
+		return
 	}
 
-	fmt.Println("Shutting down..")
+	log.Infoln("Shutting down..")
 	srv.Shutdown()
-	fmt.Println("Exiting..")
-	os.Exit(excode)
+	log.Infoln("Exiting..")
 }
 
 func parseFlags() *config {
@@ -144,6 +139,10 @@ func parseFlags() *config {
 	// http shutdown and request timeout
 	flag.DurationVar(&cfg.HTTPTimeout, "web.timeout", 30*time.Second,
 		"The timeout to use for HTTP requests and server shutdown. Defaults to 30s.",
+	)
+
+	flag.StringVar(&cfg.LogLevel, "log.level", "info",
+		"Valid levels: [debug, info, warn, error, fatal]",
 	)
 
 	flag.Parse()
