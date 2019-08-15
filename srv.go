@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -59,6 +61,7 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 	prometheus.MustRegister(c.rx)
 
 	c.mux.HandleFunc(c.conf.HTTPWritePath, func(w http.ResponseWriter, r *http.Request) {
+		defer Recover()
 		compressed, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -82,6 +85,7 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 	})
 
 	c.mux.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
+		defer Recover()
 		compressed, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -186,4 +190,16 @@ func (c *p2cServer) Shutdown() {
 		log.Warnf("Writer shutdown timed out, samples will be lost..")
 	}
 
+}
+
+func Recover() {
+	if r := recover(); r != nil {
+		err, ok := r.(error)
+		if !ok {
+			err = fmt.Errorf("%v", r)
+		}
+		stack := string(debug.Stack())
+		stack = strings.Replace(stack, "\t", "    ", -1)
+		log.Errorln("[PANIC RECOVER]", err, stack)
+	}
 }
