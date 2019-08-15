@@ -218,6 +218,8 @@ func (r *p2cReader) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) 
 	for _, ts := range tsres {
 		resp.Results[0].Timeseries = append(resp.Results[0].Timeseries, ts)
 	}
+	r.rx.Add(float64(len(req.Queries)))
+	r.tx.Add(float64(len(tsres)))
 	r.timings.Observe(time.Since(start).Seconds())
 
 	log.Debugf("query: returning %d rows for %d queries\n", rcount, len(req.Queries))
