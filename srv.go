@@ -64,6 +64,7 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		defer r.Body.Close()
 
 		reqBuf, err := snappy.Decode(nil, compressed)
 		if err != nil {
@@ -86,6 +87,7 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		defer r.Body.Close()
 
 		reqBuf, err := snappy.Decode(nil, compressed)
 		if err != nil {

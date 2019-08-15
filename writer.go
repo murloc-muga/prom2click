@@ -48,6 +48,8 @@ func NewP2CWriter(conf *config, reqs chan *p2cRequest) (*p2cWriter, error) {
 		return w, err
 	}
 
+	CreateDBTable(w.db, w.conf.ChDB, w.conf.ChTable)
+
 	w.tx = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "sent_samples_total",
@@ -150,7 +152,7 @@ func (w *p2cWriter) Start() {
 				w.ko.Add(1.0)
 			} else {
 				w.tx.Add(float64(nmetrics))
-				w.timings.Observe(float64(time.Since(tstart)))
+				w.timings.Observe(time.Since(tstart).Seconds())
 			}
 
 		}

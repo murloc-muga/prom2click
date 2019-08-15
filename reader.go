@@ -5,16 +5,21 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/kshvakov/clickhouse"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
 )
 
 type p2cReader struct {
-	conf *config
-	db   *sql.DB
+	conf    *config
+	db      *sql.DB
+	rx      prometheus.Counter
+	tx      prometheus.Counter
+	timings prometheus.Histogram
 }
 
 // getTimePeriod return select and where SQL chunks relating to the time period -or- error
@@ -31,21 +36,6 @@ func (r *p2cReader) getTimePeriod(query *prompb.Query) (string, string, error) {
 		err = errors.New("Start time is after end time")
 		return "", "", err
 	}
-
-	// need time period in seconds
-	// tperiod := tend - tstart
-
-	// // need to split time period into <nsamples> - also, don't divide by zero
-	// if r.conf.CHMaxSamples < 1 {
-	// 	err = fmt.Errorf(fmt.Sprintf("Invalid CHMaxSamples: %d", r.conf.CHMaxSamples))
-	// 	return "", "", err
-	// }
-	// taggr := tperiod / int64(r.conf.CHMaxSamples)
-	// if taggr < int64(r.conf.CHMinPeriod) {
-	// 	taggr = int64(r.conf.CHMinPeriod)
-	// }
-
-	// selectSQL := fmt.Sprintf(tselSQL, taggr, taggr)
 	whereSQL := fmt.Sprintf(twhereSQL, tstart, tstart, tend)
 
 	return tselSQL, whereSQL, nil
@@ -125,6 +115,28 @@ func NewP2CReader(conf *config) (*p2cReader, error) {
 		}
 		return r, err
 	}
+	r.rx = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "received_read_request_total",
+			Help: "Total number of received read request.",
+		},
+	)
+	r.tx = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "response_to_prome_samples_total",
+			Help: "Total number of response samples total.",
+		},
+	)
+	r.timings = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "read_batch_duration_seconds",
+			Help:    "Duration of sample batch read from the remote storage.",
+			Buckets: prometheus.DefBuckets,
+		},
+	)
+	prometheus.MustRegister(r.rx)
+	prometheus.MustRegister(r.tx)
+	prometheus.MustRegister(r.timings)
 
 	return r, nil
 }
@@ -144,6 +156,7 @@ func (r *p2cReader) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) 
 
 	// for debugging/figuring out query format/etc
 	rcount := 0
+	start := time.Now()
 	for _, q := range req.Queries {
 		// remove me..
 		log.Debugf("\nquery: start: %d, end: %d\n\n", q.StartTimestampMs, q.EndTimestampMs)
@@ -205,6 +218,7 @@ func (r *p2cReader) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) 
 	for _, ts := range tsres {
 		resp.Results[0].Timeseries = append(resp.Results[0].Timeseries, ts)
 	}
+	r.timings.Observe(time.Since(start).Seconds())
 
 	log.Debugf("query: returning %d rows for %d queries\n", rcount, len(req.Queries))
 
