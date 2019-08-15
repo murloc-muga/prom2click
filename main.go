@@ -86,12 +86,12 @@ func parseFlags() *config {
 	)
 
 	// clickhouse insertion batch size
-	flag.IntVar(&cfg.ChBatch, "ch.batch", 8192,
+	flag.IntVar(&cfg.ChBatch, "ch.batch", 65536,
 		"Clickhouse write batch size (n metrics).",
 	)
 
 	// channel buffer size between http server => clickhouse writer(s)
-	flag.IntVar(&cfg.ChanSize, "ch.buffer", 8192,
+	flag.IntVar(&cfg.ChanSize, "ch.buffer", 65536,
 		"Maximum internal channel buffer size (n requests).",
 	)
 
@@ -139,10 +139,6 @@ func parseFlags() *config {
 	// http shutdown and request timeout
 	flag.DurationVar(&cfg.HTTPTimeout, "web.timeout", 30*time.Second,
 		"The timeout to use for HTTP requests and server shutdown. Defaults to 30s.",
-	)
-
-	flag.StringVar(&cfg.LogLevel, "log.level", "info",
-		"Valid levels: [debug, info, warn, error, fatal]",
 	)
 
 	flag.Parse()

@@ -39,6 +39,15 @@ func NewP2CWriter(conf *config, reqs chan *p2cRequest) (*p2cWriter, error) {
 		return w, err
 	}
 
+	if err := w.db.Ping(); err != nil {
+		if exception, ok := err.(*clickhouse.Exception); ok {
+			log.Errorf("[%d] %s \n%s\n", exception.Code, exception.Message, exception.StackTrace)
+		} else {
+			log.Errorln(err)
+		}
+		return w, err
+	}
+
 	w.tx = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "sent_samples_total",
@@ -115,6 +124,7 @@ func (w *p2cWriter) Start() {
 
 			// build statements
 			smt, err := tx.Prepare(sql)
+			defer smt.Close()
 			for _, req := range reqs {
 				if err != nil {
 					log.Errorf("prepare statement: %s\n", err.Error())

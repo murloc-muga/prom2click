@@ -1,12 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/kshvakov/clickhouse"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
@@ -20,7 +20,7 @@ type p2cReader struct {
 // getTimePeriod return select and where SQL chunks relating to the time period -or- error
 func (r *p2cReader) getTimePeriod(query *prompb.Query) (string, string, error) {
 
-	var tselSQL = "SELECT COUNT() AS CNT, (intDiv(toUInt32(ts), %d) * %d) * 1000 as t"
+	var tselSQL = "SELECT COUNT() AS CNT, (toUInt32(ts) AS t"
 	var twhereSQL = "WHERE date >= toDate(%d) AND ts >= toDateTime(%d) AND ts <= toDateTime(%d)"
 	var err error
 	tstart := query.StartTimestampMs / 1000
@@ -33,22 +33,22 @@ func (r *p2cReader) getTimePeriod(query *prompb.Query) (string, string, error) {
 	}
 
 	// need time period in seconds
-	tperiod := tend - tstart
+	// tperiod := tend - tstart
 
-	// need to split time period into <nsamples> - also, don't divide by zero
-	if r.conf.CHMaxSamples < 1 {
-		err = fmt.Errorf(fmt.Sprintf("Invalid CHMaxSamples: %d", r.conf.CHMaxSamples))
-		return "", "", err
-	}
-	taggr := tperiod / int64(r.conf.CHMaxSamples)
-	if taggr < int64(r.conf.CHMinPeriod) {
-		taggr = int64(r.conf.CHMinPeriod)
-	}
+	// // need to split time period into <nsamples> - also, don't divide by zero
+	// if r.conf.CHMaxSamples < 1 {
+	// 	err = fmt.Errorf(fmt.Sprintf("Invalid CHMaxSamples: %d", r.conf.CHMaxSamples))
+	// 	return "", "", err
+	// }
+	// taggr := tperiod / int64(r.conf.CHMaxSamples)
+	// if taggr < int64(r.conf.CHMinPeriod) {
+	// 	taggr = int64(r.conf.CHMinPeriod)
+	// }
 
-	selectSQL := fmt.Sprintf(tselSQL, taggr, taggr)
+	// selectSQL := fmt.Sprintf(tselSQL, taggr, taggr)
 	whereSQL := fmt.Sprintf(twhereSQL, tstart, tstart, tend)
 
-	return selectSQL, whereSQL, nil
+	return tselSQL, whereSQL, nil
 }
 
 func (r *p2cReader) getSQL(query *prompb.Query) (string, error) {
@@ -68,81 +68,36 @@ func (r *p2cReader) getSQL(query *prompb.Query) (string, error) {
 		// note to self: add name to index.. otherwise this will be slow..
 		if m.Name == model.MetricNameLabel {
 			var whereAdd string
-			switch m.Type {
-			case prompb.LabelMatcher_EQ:
-				whereAdd = fmt.Sprintf(` name='%s' `, strings.Replace(m.Value, `'`, `\'`, -1))
-			case prompb.LabelMatcher_NEQ:
-				whereAdd = fmt.Sprintf(` name!='%s' `, strings.Replace(m.Value, `'`, `\'`, -1))
-			case prompb.LabelMatcher_RE:
-				whereAdd = fmt.Sprintf(` match(name, %s) = 1 `, strings.Replace(m.Value, `/`, `\/`, -1))
-			case prompb.LabelMatcher_NRE:
-				whereAdd = fmt.Sprintf(` match(name, %s) = 0 `, strings.Replace(m.Value, `/`, `\/`, -1))
-			}
+			whereAdd = fmt.Sprintf(` name='%s' `, strings.Replace(m.Value, `'`, `\'`, -1))
 			mwhereSQL = append(mwhereSQL, whereAdd)
 			continue
 		}
 
 		switch m.Type {
 		case prompb.LabelMatcher_EQ:
-			var insql bytes.Buffer
-			asql := "arrayExists(x -> x IN (%s), tags) = 1"
-			// value appears to be | sep'd for multiple matches
-			for i, val := range strings.Split(m.Value, "|") {
-				if len(val) < 1 {
-					continue
-				}
-				if i == 0 {
-					istr := fmt.Sprintf(`'%s=%s' `, m.Name, strings.Replace(val, `'`, `\'`, -1))
-					insql.WriteString(istr)
-				} else {
-					istr := fmt.Sprintf(`,'%s=%s' `, m.Name, strings.Replace(val, `'`, `\'`, -1))
-					insql.WriteString(istr)
-				}
-			}
-			wstr := fmt.Sprintf(asql, insql.String())
+			asql := "has(tags, '%s=%s') = 1"
+			wstr := fmt.Sprintf(asql, m.Name, strings.Replace(m.Value, `'`, `\'`, -1))
 			mwhereSQL = append(mwhereSQL, wstr)
 
 		case prompb.LabelMatcher_NEQ:
-			var insql bytes.Buffer
-			asql := "arrayExists(x -> x IN (%s), tags) = 0"
-			// value appears to be | sep'd for multiple matches
-			for i, val := range strings.Split(m.Value, "|") {
-				if len(val) < 1 {
-					continue
-				}
-				if i == 0 {
-					istr := fmt.Sprintf(`'%s=%s' `, m.Name, strings.Replace(val, `'`, `\'`, -1))
-					insql.WriteString(istr)
-				} else {
-					istr := fmt.Sprintf(`,'%s=%s' `, m.Name, strings.Replace(val, `'`, `\'`, -1))
-					insql.WriteString(istr)
-				}
-			}
-			wstr := fmt.Sprintf(asql, insql.String())
+			asql := "has(tags, '%s=%s') = 0"
+			wstr := fmt.Sprintf(asql, m.Name, strings.Replace(m.Value, `'`, `\'`, -1))
 			mwhereSQL = append(mwhereSQL, wstr)
 
 		case prompb.LabelMatcher_RE:
-			asql := `arrayExists(x -> 1 == match(x, '^%s=%s'),tags) = 1`
+			asql := `arrayExists(x -> match(x, '^%s=%s$'),tags) = 1`
 			// we can't have ^ in the regexp since keys are stored in arrays of key=value
-			if strings.HasPrefix(m.Value, "^") {
-				val := strings.Replace(m.Value, "^", "", 1)
-				val = strings.Replace(val, `/`, `\/`, -1)
-				mwhereSQL = append(mwhereSQL, fmt.Sprintf(asql, m.Name, val))
-			} else {
-				val := strings.Replace(m.Value, `/`, `\/`, -1)
-				mwhereSQL = append(mwhereSQL, fmt.Sprintf(asql, m.Name, val))
-			}
+			val := strings.TrimPrefix(m.Value, "^")
+			val = strings.TrimSuffix(val, "$")
+			val = strings.Replace(val, `/`, `\/`, -1)
+			mwhereSQL = append(mwhereSQL, fmt.Sprintf(asql, m.Name, val))
 
 		case prompb.LabelMatcher_NRE:
-			asql := `arrayExists(x -> 1 == match(x, '^%s=%s'),tags) = 0`
-			if strings.HasPrefix(m.Value, "^") {
-				val := strings.Replace(m.Value, "^", "", 1)
-				val = strings.Replace(val, `/`, `\/`, -1)
-				mwhereSQL = append(mwhereSQL, fmt.Sprintf(asql, m.Name, val))
-			} else {
-				val := strings.Replace(m.Value, `/`, `\/`, -1)
-				mwhereSQL = append(mwhereSQL, fmt.Sprintf(asql, m.Name, val))
-			}
+			asql := `arrayExists(x -> match(x, '^%s=%s$'),tags) = 0`
+			val := strings.TrimPrefix(m.Value, "^")
+			val = strings.TrimSuffix(val, "$")
+			val = strings.Replace(val, `/`, `\/`, -1)
+			mwhereSQL = append(mwhereSQL, fmt.Sprintf(asql, m.Name, val))
 		}
 	}
 
@@ -160,6 +115,14 @@ func NewP2CReader(conf *config) (*p2cReader, error) {
 	r.db, err = sql.Open("clickhouse", r.conf.ChDSN)
 	if err != nil {
 		log.Errorf("Error connecting to clickhouse: %s\n", err.Error())
+		return r, err
+	}
+	if err := r.db.Ping(); err != nil {
+		if exception, ok := err.(*clickhouse.Exception); ok {
+			log.Errorf("[%d] %s \n%s\n", exception.Code, exception.Message, exception.StackTrace)
+		} else {
+			log.Errorln(err)
+		}
 		return r, err
 	}
 
@@ -202,10 +165,10 @@ func (r *p2cReader) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) 
 		// todo: metrics on number of errors, rows, selects, timings, etc
 		rows, err = r.db.Query(sqlStr)
 		if err != nil {
-			log.Errorf("query failed: %s", sqlStr)
-			log.Errorf("query error: %s\n", err)
+			log.Errorf("query error: %s \n %s\n", sqlStr, err)
 			return &resp, err
 		}
+		defer rows.Close()
 
 		// build map of timeseries from sql result
 
@@ -232,8 +195,7 @@ func (r *p2cReader) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) 
 				tsres[key] = ts
 			}
 			ts.Samples = append(ts.Samples, prompb.Sample{
-				Value: float64(value),
-				// TimestampMs: t,
+				Value:     float64(value),
 				Timestamp: t,
 			})
 		}
