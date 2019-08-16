@@ -25,7 +25,7 @@ type p2cReader struct {
 // getTimePeriod return select and where SQL chunks relating to the time period -or- error
 func (r *p2cReader) getTimePeriod(query *prompb.Query) (string, string, error) {
 
-	var tselSQL = "SELECT COUNT() AS CNT, (toUInt32(ts) AS t"
+	var tselSQL = "SELECT COUNT() AS CNT, toUInt32(ts) AS t"
 	var twhereSQL = "WHERE date >= toDate(%d) AND ts >= toDateTime(%d) AND ts <= toDateTime(%d)"
 	var err error
 	tstart := query.StartTimestampMs / 1000
