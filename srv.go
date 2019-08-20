@@ -157,7 +157,7 @@ func (c *p2cServer) process(req prompb.WriteRequest) {
 		for _, sample := range series.Samples {
 			p2c := new(p2cRequest)
 			p2c.name = name
-			p2c.ts = time.Unix(sample.Timestamp, 0)
+			p2c.ts = time.Unix(sample.Timestamp/1000, 0)
 			p2c.val = sample.Value
 			p2c.tags = tags
 			c.requests <- p2c
