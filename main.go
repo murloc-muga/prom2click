@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/prometheus/common/log"
@@ -15,13 +14,15 @@ import (
 
 type config struct {
 	//tcp://host1:9000?username=user&password=qwerty&database=clicks&read_timeout=10&write_timeout=20&alt_hosts=host2:9000,host3:9000
-	ChDSN           string
-	ChDB            string
-	ChTable         string
-	ChBatch         int
+	DSN             string
+	DB              string
+	DBMaxIdle       int
+	DBMaxOpen       int
+	Table           string
+	Batch           int
 	ChanSize        int
+	Process         int
 	CHQuantile      float64
-	CHMaxSamples    int
 	CHMinPeriod     int
 	HTTPTimeout     time.Duration
 	HTTPAddr        string
@@ -68,7 +69,7 @@ func parseFlags() *config {
 	// clickhouse dsn
 	ddsn := "tcp://127.0.0.1:9000?username=&password=&database=metrics&" +
 		"read_timeout=10&write_timeout=10&alt_hosts="
-	flag.StringVar(&cfg.ChDSN, "ch.dsn", ddsn,
+	flag.StringVar(&cfg.DSN, "ch.dsn", ddsn,
 		"The clickhouse server DSN to write to eg."+
 			"tcp://host1:9000?username=user&password=qwerty&database=clicks&"+
 			"read_timeout=10&write_timeout=20&alt_hosts=host2:9000,host3:9000"+
@@ -76,17 +77,20 @@ func parseFlags() *config {
 	)
 
 	// clickhouse db
-	flag.StringVar(&cfg.ChDB, "ch.db", "metrics",
+	flag.StringVar(&cfg.DB, "ch.db", "metrics",
 		"The clickhouse database to write to.",
 	)
 
+	flag.IntVar(&cfg.DBMaxIdle, "ch.db.maxIdle", 2, "The database max idle connection.")
+	flag.IntVar(&cfg.DBMaxOpen, "ch.db.maxopen", 0, "The database max open connection.")
+
 	// clickhouse table
-	flag.StringVar(&cfg.ChTable, "ch.table", "samples",
+	flag.StringVar(&cfg.Table, "ch.table", "samples",
 		"The clickhouse table to write to.",
 	)
 
 	// clickhouse insertion batch size
-	flag.IntVar(&cfg.ChBatch, "ch.batch", 65536,
+	flag.IntVar(&cfg.Batch, "ch.batch", 65536,
 		"Clickhouse write batch size (n metrics).",
 	)
 
@@ -95,26 +99,15 @@ func parseFlags() *config {
 		"Maximum internal channel buffer size (n requests).",
 	)
 
+	flag.IntVar(&cfg.Process, "ch.process", 1,
+		"The number of goroutine to consume channel and write to storage.",
+	)
+
 	// quantile (eg. 0.9 for 90th) for aggregation of timeseries values from CH
 	flag.Float64Var(&cfg.CHQuantile, "ch.quantile", 0.75,
 		"Quantile/Percentile for time series aggregation when the number "+
 			"of points exceeds ch.maxsamples.",
 	)
-
-	// maximum number of samples to return
-	// todo: fixup strings.. yuck.
-	flag.IntVar(&cfg.CHMaxSamples, "ch.maxsamples", 8192,
-		"Maximum number of samples to return to Prometheus for a remote read "+
-			"request - the minimum accepted value is 50. "+
-			"Note: if you set this too low there can be issues displaying graphs in grafana. "+
-			"Increasing this will cause query times and memory utilization to grow. You'll "+
-			"probably need to experiment with this.",
-	)
-	// need to ensure this isn't 0 - divide by 0..
-	if cfg.CHMaxSamples < 50 {
-		fmt.Printf("Error: invalid ch.maxsamples of %d - minimum is 50\n", cfg.CHMaxSamples)
-		os.Exit(1)
-	}
 
 	// http shutdown and request timeout
 	flag.IntVar(&cfg.CHMinPeriod, "ch.minperiod", 10,

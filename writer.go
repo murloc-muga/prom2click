@@ -1,16 +1,17 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"sort"
 	"time"
 
 	"sync"
 
-	"github.com/kshvakov/clickhouse"
+	"github.com/ClickHouse/clickhouse-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/prompb"
 )
 
 var insertSQL = `INSERT INTO %s.%s
@@ -18,147 +19,182 @@ var insertSQL = `INSERT INTO %s.%s
 	VALUES	(?, ?, ?, ?, ?)`
 
 type p2cWriter struct {
-	conf     *config
-	requests chan *p2cRequest
-	wg       sync.WaitGroup
-	db       *sql.DB
-	tx       prometheus.Counter
-	ko       prometheus.Counter
-	test     prometheus.Counter
-	timings  prometheus.Histogram
+	conf         *config
+	requests     chan *p2cRequest
+	wg           sync.WaitGroup
+	recvCounter  prometheus.Counter
+	writeCounter prometheus.Counter
+	ko           prometheus.Counter
+	timings      prometheus.Histogram
 }
 
 func NewP2CWriter(conf *config, reqs chan *p2cRequest) (*p2cWriter, error) {
-	var err error
+	var subNamesapce = "writer"
 	w := new(p2cWriter)
 	w.conf = conf
 	w.requests = reqs
-	w.db, err = sql.Open("clickhouse", w.conf.ChDSN)
-	if err != nil {
-		log.Errorf("connecting to clickhouse: %s\n", err.Error())
-		return w, err
-	}
 
-	if err := w.db.Ping(); err != nil {
-		if exception, ok := err.(*clickhouse.Exception); ok {
-			log.Errorf("[%d] %s \n%s\n", exception.Code, exception.Message, exception.StackTrace)
-		} else {
-			log.Errorln(err)
-		}
-		return w, err
-	}
+	// CreateDBTable(w.db, w.conf.ChDB, w.conf.ChTable)
 
-	CreateDBTable(w.db, w.conf.ChDB, w.conf.ChTable)
-
-	w.tx = prometheus.NewCounter(
+	w.recvCounter = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "sent_samples_total",
-			Help: "Total number of processed samples sent to remote storage.",
+			Namespace: namespace,
+			Subsystem: subNamesapce,
+			Name:      "request_samples_total",
+			Help:      "Total number of remote write request samples",
+		},
+	)
+
+	w.writeCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: subNamesapce,
+			Name:      "write_samples_total",
+			Help:      "Total number of processed samples sent to storage.",
 		},
 	)
 
 	w.ko = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "failed_samples_total",
-			Help: "Total number of processed samples which failed on send to remote storage.",
-		},
-	)
-
-	w.test = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "prometheus_remote_storage_sent_batch_duration_seconds_bucket_test",
-			Help: "Test metric to ensure backfilled metrics are readable via prometheus.",
+			Namespace: namespace,
+			Subsystem: subNamesapce,
+			Name:      "database_error_total",
+			Help:      "Total number of processed samples which failed on send to remote storage.",
 		},
 	)
 
 	w.timings = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
-			Name:    "sent_batch_duration_seconds",
-			Help:    "Duration of sample batch send calls to the remote storage.",
-			Buckets: prometheus.DefBuckets,
+			Namespace: namespace,
+			Subsystem: subNamesapce,
+			Name:      "sent_batch_duration_seconds",
+			Help:      "Duration of sample batch send calls to the remote storage.",
+			Buckets:   prometheus.DefBuckets,
 		},
 	)
-	prometheus.MustRegister(w.tx)
+	prometheus.MustRegister(w.recvCounter, w.writeCounter)
 	prometheus.MustRegister(w.ko)
-	prometheus.MustRegister(w.test)
 	prometheus.MustRegister(w.timings)
 
 	return w, nil
 }
 
-func (w *p2cWriter) Start() {
-
-	go func() {
-		w.wg.Add(1)
-		log.Infoln("Writer starting..")
-		sql := fmt.Sprintf(insertSQL, w.conf.ChDB, w.conf.ChTable)
-		ok := true
-		for ok {
-			w.test.Add(1)
-			// get next batch of requests
-			var reqs []*p2cRequest
-
-			tstart := time.Now()
-			for i := 0; i < w.conf.ChBatch; i++ {
-				var req *p2cRequest
-				// get requet and also check if channel is closed
-				req, ok = <-w.requests
-				if !ok {
-					log.Warnln("Writer stopping..")
+func (c *p2cWriter) write(req *prompb.WriteRequest) {
+	for _, series := range req.Timeseries {
+		c.recvCounter.Add(float64(len(series.Samples)))
+		var (
+			name string
+			tags []string
+		)
+		var isAlerts bool
+		for _, label := range series.Labels {
+			if model.LabelName(label.Name) == model.MetricNameLabel {
+				name = label.Value
+				if name == "ALERTS" || name == "ALERTS_FOR_STATUS" {
+					isAlerts = true
 					break
 				}
-				reqs = append(reqs, req)
+			} else {
+				// store tags in <key>=<value> format
+				// allows for has(tags, "key=val") searches
+				// probably impossible/difficult to do regex searches on tags
+				t := fmt.Sprintf("%s=%s", label.Name, label.Value)
+				tags = append(tags, t)
 			}
+		}
+		if isAlerts {
+			continue
+		}
+		for _, sample := range series.Samples {
+			p2c := new(p2cRequest)
+			p2c.name = name
+			p2c.ts = time.Unix(sample.Timestamp/1000, 0)
+			p2c.val = sample.Value
+			p2c.tags = tags
+			c.requests <- p2c
+		}
+	}
+}
 
-			// ensure we have something to send..
-			nmetrics := len(reqs)
-			if nmetrics < 1 {
-				continue
-			}
+func (w *p2cWriter) StartProcess() {
+	log.Infof("start write goroutine process with %d", w.conf.Process)
+	sql := fmt.Sprintf(insertSQL, w.conf.DB, w.conf.Table)
+	for i := 0; i < w.conf.Process; i++ {
+		go func() {
+			w.wg.Add(1)
+			log.Infoln("Writer starting..")
+			ok := true
+			for ok {
+				// get next batch of requests
+				var reqs []*p2cRequest
 
-			// post them to db all at once
-			tx, err := w.db.Begin()
-			if err != nil {
-				log.Errorf("begin transaction: %s\n", err.Error())
-				w.ko.Add(1.0)
-				continue
-			}
+				timeout := time.NewTimer(time.Second * 5)
+				tstart := time.Now()
+			batch:
+				for i := 0; i < w.conf.Batch; i++ {
+					var req *p2cRequest
+					// if request not enough and timeout, insert current request to database first.
+					select {
+					case req, ok = <-w.requests:
+						if !ok {
+							log.Warnln("Writer stopping..")
+							break batch
+						}
+						reqs = append(reqs, req)
+					case <-timeout.C:
+						break batch
+					}
+				}
 
-			// build statements
-			smt, err := tx.Prepare(sql)
-			defer smt.Close()
-			for _, req := range reqs {
-				if err != nil {
-					log.Errorf("prepare statement: %s\n", err.Error())
-					w.ko.Add(1.0)
+				// ensure we have something to send..
+				nmetrics := len(reqs)
+				if nmetrics < 1 {
 					continue
 				}
 
-				// ensure tags are inserted in the same order each time
-				// possibly/probably impacts indexing?
-				sort.Strings(req.tags)
-				_, err = smt.Exec(req.ts, req.name, clickhouse.Array(req.tags),
-					req.val, req.ts)
-
+				// post them to db all at once
+				tx, err := db.Begin()
 				if err != nil {
-					log.Errorf("statement exec: %s\n", err.Error())
-					w.ko.Add(1.0)
+					log.Errorf("begin transaction: %s\n", err.Error())
+					w.ko.Inc()
+					continue
 				}
-			}
 
-			// commit and record metrics
-			if err = tx.Commit(); err != nil {
-				log.Errorf("commit failed: %s\n", err.Error())
-				w.ko.Add(1.0)
-			} else {
-				w.tx.Add(float64(nmetrics))
-				w.timings.Observe(time.Since(tstart).Seconds())
-			}
+				// build statements
+				smt, err := tx.Prepare(sql)
+				if err != nil {
+					log.Errorf("prepare statement: %s\n", err.Error())
+					w.ko.Inc()
+					continue
+				}
+				defer smt.Close()
+				for _, req := range reqs {
+					// ensure tags are inserted in the same order each time
+					// possibly/probably impacts indexing?
+					sort.Strings(req.tags)
+					_, err = smt.Exec(req.ts, req.name, clickhouse.Array(req.tags),
+						req.val, req.ts)
 
-		}
-		log.Infoln("Writer stopped..")
-		w.wg.Done()
-	}()
+					if err != nil {
+						log.Errorf("statement exec: %s\n", err.Error())
+						w.ko.Inc()
+					}
+				}
+
+				// commit and record metrics
+				if err = tx.Commit(); err != nil {
+					log.Errorf("commit failed: %s\n", err.Error())
+					w.ko.Inc()
+				} else {
+					w.writeCounter.Add(float64(nmetrics))
+					w.timings.Observe(time.Since(tstart).Seconds())
+				}
+
+			}
+			log.Infoln("Writer stopped..")
+			w.wg.Done()
+		}()
+	}
 }
 
 func (w *p2cWriter) Wait() {

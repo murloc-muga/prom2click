@@ -1,21 +1,26 @@
 package main
 
 import (
-	"fmt"
+	"database/sql"
 	"io/ioutil"
 	"net/http"
-	"runtime/debug"
-	"strings"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go"
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/model"
-	"github.com/prometheus/log"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/log"
 	"github.com/prometheus/prometheus/prompb"
 	"gopkg.in/tylerb/graceful.v1"
 )
+
+const (
+	namespace = "prom2click"
+)
+
+var db *sql.DB
 
 type p2cRequest struct {
 	name string
@@ -25,16 +30,36 @@ type p2cRequest struct {
 }
 
 type p2cServer struct {
-	requests chan *p2cRequest
-	mux      *http.ServeMux
-	conf     *config
-	writer   *p2cWriter
-	reader   *p2cReader
-	rx       prometheus.Counter
+	requests    chan *p2cRequest
+	mux         *http.ServeMux
+	conf        *config
+	writer      *p2cWriter
+	reader      *p2cReader
+	rx          prometheus.Counter
+	writeReqCnt prometheus.Counter
+	readReqCnt  prometheus.Counter
 }
 
 func NewP2CServer(conf *config) (*p2cServer, error) {
 	var err error
+
+	db, err = sql.Open("clickhouse", conf.DSN)
+	if err != nil {
+		log.Errorf("connecting to clickhouse: %s\n", err.Error())
+		return nil, err
+	}
+
+	if err := db.Ping(); err != nil {
+		if exception, ok := err.(*clickhouse.Exception); ok {
+			log.Errorf("[%d] %s \n%s\n", exception.Code, exception.Message, exception.StackTrace)
+		} else {
+			log.Errorln(err)
+		}
+		return nil, err
+	}
+	db.SetMaxIdleConns(conf.DBMaxIdle)
+	db.SetMaxOpenConns(conf.DBMaxOpen)
+
 	c := new(p2cServer)
 	c.requests = make(chan *p2cRequest, conf.ChanSize)
 	c.mux = http.NewServeMux()
@@ -54,121 +79,120 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 
 	c.rx = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "received_samples_total",
-			Help: "Total number of received samples.",
+			Namespace: namespace,
+			Name:      "received_samples_total",
+			Help:      "Total number of received samples.",
 		},
 	)
+	inFlightGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "in_flight_requests",
+		Help:      "A gauge of requests currently being served by the wrapped handler.",
+	})
+
+	counter := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "api_requests_total",
+			Help:      "A counter for requests to the wrapped handler.",
+		},
+		[]string{"code", "method"},
+	)
+
+	// duration is partitioned by the HTTP method and handler. It uses custom
+	// buckets based on the expected request duration.
+	duration := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "request_duration_seconds",
+			Help:      "A histogram of latencies for requests.",
+			Buckets:   []float64{.25, .5, 1, 2.5, 5, 10},
+		},
+		[]string{"handler", "code", "method"},
+	)
 	prometheus.MustRegister(c.rx)
+	prometheus.MustRegister(inFlightGauge, counter, duration)
+	writeHandler := promhttp.InstrumentHandlerInFlight(inFlightGauge,
+		promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"handler": c.conf.HTTPWritePath}),
+			promhttp.InstrumentHandlerCounter(counter, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				compressed, err := ioutil.ReadAll(r.Body)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				defer r.Body.Close()
+				reqBuf, err := snappy.Decode(nil, compressed)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
 
-	c.mux.HandleFunc(c.conf.HTTPWritePath, func(w http.ResponseWriter, r *http.Request) {
-		defer Recover()
-		compressed, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer r.Body.Close()
+				var req prompb.WriteRequest
+				if err := proto.Unmarshal(reqBuf, &req); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
 
-		reqBuf, err := snappy.Decode(nil, compressed)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+				go c.writer.write(&req)
+			})),
+		),
+	)
 
-		var req prompb.WriteRequest
-		if err := proto.Unmarshal(reqBuf, &req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+	readHandler := promhttp.InstrumentHandlerInFlight(inFlightGauge,
+		promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"handler": "/read"}),
+			promhttp.InstrumentHandlerCounter(counter, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				compressed, err := ioutil.ReadAll(r.Body)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				defer r.Body.Close()
+				reqBuf, err := snappy.Decode(nil, compressed)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
 
-		c.process(req)
-	})
+				var req prompb.ReadRequest
+				if err := proto.Unmarshal(reqBuf, &req); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
 
-	c.mux.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
-		defer Recover()
-		compressed, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer r.Body.Close()
+				var resp *prompb.ReadResponse
+				resp, err = c.reader.Read(&req)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
 
-		reqBuf, err := snappy.Decode(nil, compressed)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+				data, err := proto.Marshal(resp)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
 
-		var req prompb.ReadRequest
-		if err := proto.Unmarshal(reqBuf, &req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+				w.Header().Set("Content-Type", "application/x-protobuf")
+				w.Header().Set("Content-Encoding", "snappy")
 
-		var resp *prompb.ReadResponse
-		resp, err = c.reader.Read(&req)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		data, err := proto.Marshal(resp)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/x-protobuf")
-		w.Header().Set("Content-Encoding", "snappy")
-
-		compressed = snappy.Encode(nil, data)
-		if _, err := w.Write(compressed); err != nil {
-			log.Error(err)
-			return
-		}
-	})
-
-	c.mux.Handle(c.conf.HTTPMetricsPath, prometheus.InstrumentHandler(
-		c.conf.HTTPMetricsPath, prometheus.UninstrumentedHandler(),
-	))
+				compressed = snappy.Encode(nil, data)
+				if _, err := w.Write(compressed); err != nil {
+					log.Error(err)
+					return
+				}
+			})),
+		),
+	)
+	c.mux.Handle(c.conf.HTTPWritePath, writeHandler)
+	c.mux.Handle("/read", readHandler)
+	c.mux.Handle(c.conf.HTTPMetricsPath, promhttp.Handler())
 
 	return c, nil
 }
 
-func (c *p2cServer) process(req prompb.WriteRequest) {
-	for _, series := range req.Timeseries {
-		c.rx.Add(float64(len(series.Samples)))
-		var (
-			name string
-			tags []string
-		)
-
-		for _, label := range series.Labels {
-			if model.LabelName(label.Name) == model.MetricNameLabel {
-				name = label.Value
-			}
-			// store tags in <key>=<value> format
-			// allows for has(tags, "key=val") searches
-			// probably impossible/difficult to do regex searches on tags
-			t := fmt.Sprintf("%s=%s", label.Name, label.Value)
-			tags = append(tags, t)
-		}
-
-		for _, sample := range series.Samples {
-			p2c := new(p2cRequest)
-			p2c.name = name
-			p2c.ts = time.Unix(sample.Timestamp/1000, 0)
-			p2c.val = sample.Value
-			p2c.tags = tags
-			c.requests <- p2c
-		}
-
-	}
-}
-
 func (c *p2cServer) Start() error {
 	log.Infoln("HTTP server starting...")
-	c.writer.Start()
+	c.writer.StartProcess()
 	return graceful.RunWithErr(c.conf.HTTPAddr, c.conf.HTTPTimeout, c.mux)
 }
 
@@ -189,17 +213,5 @@ func (c *p2cServer) Shutdown() {
 	case <-time.After(10 * time.Second):
 		log.Warnf("Writer shutdown timed out, samples will be lost..")
 	}
-
-}
-
-func Recover() {
-	if r := recover(); r != nil {
-		err, ok := r.(error)
-		if !ok {
-			err = fmt.Errorf("%v", r)
-		}
-		stack := string(debug.Stack())
-		stack = strings.Replace(stack, "\t", "    ", -1)
-		log.Errorln("[PANIC RECOVER]", err, stack)
-	}
+	db.Close()
 }

@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kshvakov/clickhouse"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
@@ -16,7 +15,6 @@ import (
 
 type p2cReader struct {
 	conf    *config
-	db      *sql.DB
 	rx      prometheus.Counter
 	tx      prometheus.Counter
 	timings prometheus.Histogram
@@ -93,45 +91,39 @@ func (r *p2cReader) getSQL(query *prompb.Query) (string, error) {
 
 	// put select and where together with group by etc
 	tempSQL := "%s, name, tags, quantile(%f)(val) as value FROM %s.%s %s AND %s GROUP BY t, name, tags ORDER BY t"
-	sql := fmt.Sprintf(tempSQL, tselectSQL, r.conf.CHQuantile, r.conf.ChDB, r.conf.ChTable, twhereSQL,
+	sql := fmt.Sprintf(tempSQL, tselectSQL, r.conf.CHQuantile, r.conf.DB, r.conf.Table, twhereSQL,
 		strings.Join(mwhereSQL, " AND "))
 	return sql, nil
 }
 
 func NewP2CReader(conf *config) (*p2cReader, error) {
-	var err error
+	var subNamesapce = "reader"
 	r := new(p2cReader)
 	r.conf = conf
-	r.db, err = sql.Open("clickhouse", r.conf.ChDSN)
-	if err != nil {
-		log.Errorf("Error connecting to clickhouse: %s\n", err.Error())
-		return r, err
-	}
-	if err := r.db.Ping(); err != nil {
-		if exception, ok := err.(*clickhouse.Exception); ok {
-			log.Errorf("[%d] %s \n%s\n", exception.Code, exception.Message, exception.StackTrace)
-		} else {
-			log.Errorln(err)
-		}
-		return r, err
-	}
+
 	r.rx = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "received_read_request_total",
-			Help: "Total number of received read request.",
+			Namespace: namespace,
+			Subsystem: subNamesapce,
+			Name:      "request_query_total",
+			Help:      "Total number of read request query.",
 		},
 	)
 	r.tx = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "response_to_prome_samples_total",
-			Help: "Total number of response samples total.",
+			Namespace: namespace,
+			Subsystem: subNamesapce,
+			Name:      "response_samples_total",
+			Help:      "Total number of response samples total.",
 		},
 	)
 	r.timings = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
-			Name:    "read_batch_duration_seconds",
-			Help:    "Duration of sample batch read from the remote storage.",
-			Buckets: prometheus.DefBuckets,
+			Namespace: namespace,
+			Subsystem: subNamesapce,
+			Name:      "duration_seconds",
+			Help:      "Duration of sample batch read from the remote storage.",
+			Buckets:   prometheus.DefBuckets,
 		},
 	)
 	prometheus.MustRegister(r.rx)
@@ -176,7 +168,7 @@ func (r *p2cReader) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) 
 		}
 
 		// todo: metrics on number of errors, rows, selects, timings, etc
-		rows, err = r.db.Query(sqlStr)
+		rows, err = db.Query(sqlStr)
 		if err != nil {
 			log.Errorf("query error: %s \n %s\n", sqlStr, err)
 			return &resp, err
@@ -196,6 +188,7 @@ func (r *p2cReader) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) 
 			)
 			if err = rows.Scan(&cnt, &t, &name, &tags, &value); err != nil {
 				log.Errorf("scan: %s\n", err.Error())
+				continue
 			}
 
 			// borrowed from influx remote storage adapter - array sep
@@ -228,8 +221,8 @@ func (r *p2cReader) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) 
 
 }
 
-func makeLabels(tags []string) []prompb.Label {
-	lpairs := make([]prompb.Label, 0, len(tags))
+func makeLabels(tags []string) []*prompb.Label {
+	lpairs := make([]*prompb.Label, 0, len(tags))
 	// (currently) writer includes __name__ in tags so no need to add it here
 	// may change this to save space later..
 	for _, tag := range tags {
@@ -241,7 +234,7 @@ func makeLabels(tags []string) []prompb.Label {
 		if vals[1] == "" {
 			continue
 		}
-		lpairs = append(lpairs, prompb.Label{
+		lpairs = append(lpairs, &prompb.Label{
 			Name:  vals[0],
 			Value: vals[1],
 		})
