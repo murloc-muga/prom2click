@@ -35,7 +35,6 @@ type p2cServer struct {
 	conf        *config
 	writer      *p2cWriter
 	reader      *p2cReader
-	rx          prometheus.Counter
 	writeReqCnt prometheus.Counter
 	readReqCnt  prometheus.Counter
 }
@@ -77,13 +76,6 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 		return c, err
 	}
 
-	c.rx = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "received_samples_total",
-			Help:      "Total number of received samples.",
-		},
-	)
 	inFlightGauge := prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,
 		Name:      "in_flight_requests",
@@ -96,7 +88,7 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 			Name:      "api_requests_total",
 			Help:      "A counter for requests to the wrapped handler.",
 		},
-		[]string{"code", "method"},
+		[]string{"handler", "code", "method"},
 	)
 
 	// duration is partitioned by the HTTP method and handler. It uses custom
@@ -110,11 +102,10 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 		},
 		[]string{"handler", "code", "method"},
 	)
-	prometheus.MustRegister(c.rx)
 	prometheus.MustRegister(inFlightGauge, counter, duration)
 	writeHandler := promhttp.InstrumentHandlerInFlight(inFlightGauge,
 		promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"handler": c.conf.HTTPWritePath}),
-			promhttp.InstrumentHandlerCounter(counter, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			promhttp.InstrumentHandlerCounter(counter.MustCurryWith(prometheus.Labels{"handler": c.conf.HTTPWritePath}), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				compressed, err := ioutil.ReadAll(r.Body)
 				if err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -140,7 +131,7 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 
 	readHandler := promhttp.InstrumentHandlerInFlight(inFlightGauge,
 		promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"handler": "/read"}),
-			promhttp.InstrumentHandlerCounter(counter, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			promhttp.InstrumentHandlerCounter(counter.MustCurryWith(prometheus.Labels{"handler": "/read"}), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				compressed, err := ioutil.ReadAll(r.Body)
 				if err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)

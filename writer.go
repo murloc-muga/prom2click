@@ -19,13 +19,14 @@ var insertSQL = `INSERT INTO %s.%s
 	VALUES	(?, ?, ?, ?, ?)`
 
 type p2cWriter struct {
-	conf         *config
-	requests     chan *p2cRequest
-	wg           sync.WaitGroup
-	recvCounter  prometheus.Counter
-	writeCounter prometheus.Counter
-	ko           prometheus.Counter
-	timings      prometheus.Histogram
+	conf           *config
+	requests       chan *p2cRequest
+	wg             *sync.WaitGroup
+	recvCounter    prometheus.Counter
+	writeCounter   prometheus.Counter
+	ko             prometheus.Counter
+	timings        prometheus.Histogram
+	queueSizeGauge prometheus.GaugeFunc
 }
 
 func NewP2CWriter(conf *config, reqs chan *p2cRequest) (*p2cWriter, error) {
@@ -33,7 +34,7 @@ func NewP2CWriter(conf *config, reqs chan *p2cRequest) (*p2cWriter, error) {
 	w := new(p2cWriter)
 	w.conf = conf
 	w.requests = reqs
-
+	w.wg = new(sync.WaitGroup)
 	// CreateDBTable(w.db, w.conf.ChDB, w.conf.ChTable)
 
 	w.recvCounter = prometheus.NewCounter(
@@ -72,9 +73,18 @@ func NewP2CWriter(conf *config, reqs chan *p2cRequest) (*p2cWriter, error) {
 			Buckets:   prometheus.DefBuckets,
 		},
 	)
+	w.queueSizeGauge = prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: subNamesapce,
+			Name:      "channel_size",
+		},
+		func() float64 {
+			return float64(len(w.requests))
+		},
+	)
 	prometheus.MustRegister(w.recvCounter, w.writeCounter)
-	prometheus.MustRegister(w.ko)
-	prometheus.MustRegister(w.timings)
+	prometheus.MustRegister(w.ko, w.timings, w.queueSizeGauge)
 
 	return w, nil
 }
@@ -129,7 +139,6 @@ func (w *p2cWriter) StartProcess() {
 				var reqs []*p2cRequest
 
 				timeout := time.NewTimer(time.Second * 5)
-				tstart := time.Now()
 			batch:
 				for i := 0; i < w.conf.Batch; i++ {
 					var req *p2cRequest
@@ -151,6 +160,7 @@ func (w *p2cWriter) StartProcess() {
 				if nmetrics < 1 {
 					continue
 				}
+				tstart := time.Now()
 
 				// post them to db all at once
 				tx, err := db.Begin()
@@ -159,7 +169,6 @@ func (w *p2cWriter) StartProcess() {
 					w.ko.Inc()
 					continue
 				}
-
 				// build statements
 				smt, err := tx.Prepare(sql)
 				if err != nil {
