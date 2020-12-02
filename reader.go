@@ -24,7 +24,7 @@ type p2cReader struct {
 func (r *p2cReader) getTimePeriod(query *prompb.Query) (string, string, error) {
 
 	var tselSQL = "SELECT COUNT() AS CNT, toUInt32(ts)*1000 AS t"
-	var twhereSQL = "WHERE date >= toDate(%d) AND ts >= toDateTime(%d) AND ts <= toDateTime(%d)"
+	var twhereSQL = "WHERE date >= toDate(%d) AND date <= toDate(%d) AND ts >= toDateTime(%d) AND ts <= toDateTime(%d)"
 	var err error
 	tstart := query.StartTimestampMs / 1000
 	tend := query.EndTimestampMs / 1000
