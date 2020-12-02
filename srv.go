@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"io/ioutil"
 	"net/http"
+	_ "net/http/pprof"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go"
@@ -13,7 +18,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/prometheus/prompb"
-	"gopkg.in/tylerb/graceful.v1"
 )
 
 const (
@@ -31,12 +35,13 @@ type p2cRequest struct {
 
 type p2cServer struct {
 	requests    chan *p2cRequest
-	mux         *http.ServeMux
+	srv         *http.Server
 	conf        *config
 	writer      *p2cWriter
 	reader      *p2cReader
 	writeReqCnt prometheus.Counter
 	readReqCnt  prometheus.Counter
+	ctx         context.Context
 }
 
 func NewP2CServer(conf *config) (*p2cServer, error) {
@@ -61,8 +66,18 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 
 	c := new(p2cServer)
 	c.requests = make(chan *p2cRequest, conf.ChanSize)
-	c.mux = http.NewServeMux()
 	c.conf = conf
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func(cancel context.CancelFunc) {
+		select {
+		case <-sig:
+			cancel()
+		}
+	}(cancel)
+	c.ctx = ctx
 
 	c.writer, err = NewP2CWriter(conf, c.requests)
 	if err != nil {
@@ -174,17 +189,22 @@ func NewP2CServer(conf *config) (*p2cServer, error) {
 			})),
 		),
 	)
-	c.mux.Handle(c.conf.HTTPWritePath, writeHandler)
-	c.mux.Handle("/read", readHandler)
-	c.mux.Handle(c.conf.HTTPMetricsPath, promhttp.Handler())
 
+	http.Handle(c.conf.HTTPWritePath, writeHandler)
+	http.Handle("/read", readHandler)
+	http.Handle(c.conf.HTTPMetricsPath, promhttp.Handler())
 	return c, nil
 }
 
 func (c *p2cServer) Start() error {
 	log.Infoln("HTTP server starting...")
 	c.writer.StartProcess()
-	return graceful.RunWithErr(c.conf.HTTPAddr, c.conf.HTTPTimeout, c.mux)
+	c.srv = &http.Server{Addr: c.conf.HTTPAddr}
+	go func() {
+		<-c.ctx.Done()
+		c.srv.Shutdown(context.Background())
+	}()
+	return c.srv.ListenAndServe()
 }
 
 func (c *p2cServer) Shutdown() {

@@ -9,5 +9,4 @@ require (
 	github.com/prometheus/client_golang v1.8.0
 	github.com/prometheus/common v0.15.0
 	github.com/prometheus/prometheus v2.5.0+incompatible
-	gopkg.in/tylerb/graceful.v1 v1.2.15
 )
