@@ -52,9 +52,9 @@ Usage of ./bin/prom2click:
     * Goto [Tabix](http://ui.tabix.io/) for a quick and easy Clickhouse UI
 
     * Create clickhouse schema
-        ```sql
-        CREATE DATABASE IF NOT EXISTS metrics;
-        CREATE TABLE IF NOT EXISTS metrics.samples
+      ```sql
+      CREATE DATABASE IF NOT EXISTS metrics;
+      CREATE TABLE IF NOT EXISTS metrics.samples
             (
                   date Date DEFAULT toDate(0),
                   name String,
@@ -62,10 +62,10 @@ Usage of ./bin/prom2click:
                   val Float64,
                   ts DateTime,
                   updated DateTime DEFAULT now()
-            )
-            ENGINE = GraphiteMergeTree(
-                  date, (name, tags, ts), 8192, 'graphite_rollup'
-            );
+            ) ENGINE = GraphiteMergeTree('graphite_rollup') 
+            PARTITION BY date 
+            ORDER BY (name, tags, ts) 
+            PRIMARY KEY (name, tags, ts)
         ```
     * For a more resiliant setup you could setup shards, replicas and a distributed table
         * setup a Zookeeper cluster (or zetcd)
