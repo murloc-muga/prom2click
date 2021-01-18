@@ -34,7 +34,7 @@ func (r *p2cReader) getTimePeriod(query *prompb.Query) (string, string, error) {
 		err = errors.New("Start time is after end time")
 		return "", "", err
 	}
-	whereSQL := fmt.Sprintf(twhereSQL, tstart, tstart, tend)
+	whereSQL := fmt.Sprintf(twhereSQL, tstart, tstart, tend, tend)
 
 	return tselSQL, whereSQL, nil
 }
